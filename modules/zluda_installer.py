@@ -1,25 +1,67 @@
 import os
 import sys
+import site
 import ctypes
 import shutil
 import zipfile
 import urllib.request
-from typing import Optional, Union
+from typing import Union
 from modules import rocm
+from modules.launch_utils import args
 
 
 DLL_MAPPING = {
     'cublas.dll': 'cublas64_11.dll',
     'cusparse.dll': 'cusparse64_11.dll',
+    'cufft.dll': 'cufft64_10.dll',
+    'cufftw.dll': 'cufftw64_10.dll',
     'nvrtc.dll': 'nvrtc64_112_0.dll',
 }
-HIPSDK_TARGETS = ['rocblas.dll', 'rocsolver.dll', f'hiprtc{"".join([v.zfill(2) for v in rocm.version.split(".")])}.dll']
-ZLUDA_TARGETS = ('nvcuda.dll', 'nvml.dll',)
+HIPSDK_TARGETS = ['rocblas.dll', 'rocsolver.dll', 'hipfft.dll',]
+
+MIOpen_enabled = False
+
+path = os.path.abspath(os.environ.get('ZLUDA', '.zluda'))
 default_agent: Union[rocm.Agent, None] = None
+hipBLASLt_enabled = False
 
 
-def get_path() -> str:
-    return os.path.abspath(os.environ.get('ZLUDA', '.zluda'))
+class ZLUDAResult(ctypes.Structure):
+    _fields_ = [
+        ('return_code', ctypes.c_int),
+        ('value', ctypes.c_ulonglong),
+    ]
+
+
+class ZLUDALibrary:
+    internal: ctypes.CDLL
+
+    def __init__(self, internal: ctypes.CDLL):
+        self.internal = internal
+
+
+class Core(ZLUDALibrary):
+    def __init__(self, internal: ctypes.CDLL):
+        internal.zluda_get_hip_object.restype = ZLUDAResult
+        internal.zluda_get_hip_object.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+        try:
+            internal.zluda_get_nightly_flag.restype = ctypes.c_int
+            internal.zluda_get_nightly_flag.argtypes = []
+        except AttributeError:
+            internal.zluda_get_nightly_flag = lambda: 0
+
+        super().__init__(internal)
+
+    def to_hip_stream(self, zluda_object: ctypes.c_void_p):
+        return self.internal.zluda_get_hip_object(zluda_object, 1).value
+
+    def get_nightly_flag(self) -> int:
+        return self.internal.zluda_get_nightly_flag()
+
+
+core = None
+ml = None
 
 
 def set_default_agent(agent: rocm.Agent):
@@ -27,49 +69,102 @@ def set_default_agent(agent: rocm.Agent):
     default_agent = agent
 
 
-def install(zluda_path: os.PathLike) -> None:
-    if os.path.exists(zluda_path):
+def is_reinstall_needed() -> bool: # ZLUDA<3.9.4
+    return os.path.exists(os.path.join(path, 'cudart.dll'))
+
+
+def install():
+    if os.path.exists(path):
         return
 
-    commit = os.environ.get("ZLUDA_HASH", "1b6e012d8f2404840b524e2abae12cb91e1ac01d")
-    if rocm.version == "6.1":
-        commit = "c0804ca624963aab420cb418412b1c7fbae3454b"
-    urllib.request.urlretrieve(f'https://github.com/lshqqytiger/ZLUDA/releases/download/rel.{commit}/ZLUDA-windows-rocm{rocm.version[0]}-amd64.zip', '_zluda')
+    platform = "windows"
+    commit = os.environ.get("ZLUDA_HASH", "5e717459179dc272b7d7d23391f0fad66c7459cf")
+    if os.environ.get("ZLUDA_NIGHTLY", "0") == "1":
+        print("Environment variable 'ZLUDA_NIGHTLY' will be removed. Please use command-line argument '--use-nightly' instead.")
+        args.use_nightly = True
+    if args.use_nightly:
+        platform = "nightly-" + platform
+    urllib.request.urlretrieve(f'https://github.com/lshqqytiger/ZLUDA/releases/download/rel.{commit}/ZLUDA-{platform}-rocm{rocm.version[0]}-amd64.zip', '_zluda')
     with zipfile.ZipFile('_zluda', 'r') as archive:
         infos = archive.infolist()
         for info in infos:
             if not info.is_dir():
                 info.filename = os.path.basename(info.filename)
-                archive.extract(info, '.zluda')
+                archive.extract(info, path)
     os.remove('_zluda')
 
 
-def uninstall() -> None:
-    if os.path.exists('.zluda'):
-        shutil.rmtree('.zluda')
+def uninstall():
+    if os.path.exists(path):
+        shutil.rmtree(path)
 
 
-def make_copy(zluda_path: os.PathLike) -> None:
+def set_blaslt_enabled(enabled: bool):
+    global hipBLASLt_enabled # pylint: disable=global-statement
+    hipBLASLt_enabled = enabled
+
+
+def get_blaslt_enabled() -> bool:
+    return hipBLASLt_enabled
+
+
+def link_or_copy(src: os.PathLike, dst: os.PathLike):
+    try:
+        os.symlink(src, dst)
+    except Exception:
+        try:
+            os.link(src, dst)
+        except Exception:
+            shutil.copyfile(src, dst)
+
+
+def load():
+    global core, ml, hipBLASLt_enabled, MIOpen_enabled # pylint: disable=global-statement
+    core = Core(ctypes.windll.LoadLibrary(os.path.join(path, 'nvcuda.dll')))
+    ml = ZLUDALibrary(ctypes.windll.LoadLibrary(os.path.join(path, 'nvml.dll')))
+    is_nightly = core.get_nightly_flag() == 1
+    hipBLASLt_enabled = is_nightly and os.path.exists(rocm.blaslt_tensile_libpath) and os.path.exists(os.path.join(rocm.path, "bin", "hipblaslt.dll")) and default_agent is not None
+    MIOpen_enabled = is_nightly and os.path.exists(os.path.join(rocm.path, "bin", "MIOpen.dll"))
+
+    if hipBLASLt_enabled:
+        if not default_agent.blaslt_supported:
+            hipBLASLt_enabled = False
+        print(f'ROCm hipBLASLt: arch={default_agent.name} available={hipBLASLt_enabled}')
+
     for k, v in DLL_MAPPING.items():
-        if not os.path.exists(os.path.join(zluda_path, v)):
-            try:
-                os.link(os.path.join(zluda_path, k), os.path.join(zluda_path, v))
-            except Exception:
-                shutil.copyfile(os.path.join(zluda_path, k), os.path.join(zluda_path, v))
+        if not os.path.exists(os.path.join(path, v)):
+            link_or_copy(os.path.join(path, k), os.path.join(path, v))
 
+    if hipBLASLt_enabled and not os.path.exists(os.path.join(path, 'cublasLt64_11.dll')):
+        link_or_copy(os.path.join(path, 'cublasLt.dll'), os.path.join(path, 'cublasLt64_11.dll'))
 
-def load(zluda_path: os.PathLike) -> None:
+    if MIOpen_enabled and not os.path.exists(os.path.join(path, 'cudnn64_9.dll')):
+        link_or_copy(os.path.join(path, 'cudnn.dll'), os.path.join(path, 'cudnn64_9.dll'))
+
+    print(f"ZLUDA load: path='{path}' nightly={bool(core.get_nightly_flag())}")
+
     os.environ["ZLUDA_COMGR_LOG_LEVEL"] = "1"
+    os.environ["ZLUDA_NVRTC_LIB"] = os.path.join([v for v in site.getsitepackages() if v.endswith("site-packages")][0], "torch", "lib", "nvrtc64_112_0.dll")
 
     for v in HIPSDK_TARGETS:
         ctypes.windll.LoadLibrary(os.path.join(rocm.path, 'bin', v))
-    for v in ZLUDA_TARGETS:
-        ctypes.windll.LoadLibrary(os.path.join(zluda_path, v))
     for v in DLL_MAPPING.values():
-        ctypes.windll.LoadLibrary(os.path.join(zluda_path, v))
+        ctypes.windll.LoadLibrary(os.path.join(path, v))
+
+    if hipBLASLt_enabled:
+        os.environ.setdefault("DISABLE_ADDMM_CUDA_LT", "0")
+        ctypes.windll.LoadLibrary(os.path.join(rocm.path, 'bin', 'hipblaslt.dll'))
+        ctypes.windll.LoadLibrary(os.path.join(path, 'cublasLt64_11.dll'))
+    else:
+        os.environ["DISABLE_ADDMM_CUDA_LT"] = "1"
+
+    if MIOpen_enabled:
+        ctypes.windll.LoadLibrary(os.path.join(rocm.path, 'bin', 'MIOpen.dll'))
+        ctypes.windll.LoadLibrary(os.path.join(path, 'cudnn64_9.dll'))
 
     def conceal():
-        import torch # noqa: F401
+        import torch
+        torch.version.hip = rocm.version
         platform = sys.platform
         sys.platform = ""
         from torch.utils import cpp_extension
@@ -81,12 +176,3 @@ def load(zluda_path: os.PathLike) -> None:
             return os.path.join(cpp_extension.ROCM_HOME, *paths)
         cpp_extension._join_rocm_home = _join_rocm_home # pylint: disable=protected-access
     rocm.conceal = conceal
-
-
-def get_default_torch_version(agent: Optional[rocm.Agent]) -> str:
-    if agent is not None:
-        if agent.arch in (rocm.MicroArchitecture.RDNA, rocm.MicroArchitecture.CDNA,):
-            return "2.3.1"
-        elif agent.arch == rocm.MicroArchitecture.GCN:
-            return "2.2.1"
-    return "2.3.1"

@@ -1,11 +1,10 @@
 import os
+import sys
 
 import torch
 
 from modules import shared
 from modules.shared import cmd_opts
-from modules.dml import directml_init, directml_do_hijack
-from modules.zluda import initialize_zluda
 
 
 def initialize():
@@ -26,6 +25,7 @@ def initialize():
         pass
 
     if cmd_opts.use_directml:
+        from modules.dml import directml_init, directml_do_hijack
         directml_init()
         directml_do_hijack()
     else:
@@ -71,4 +71,10 @@ def initialize():
         from modules.onnx_impl import initialize_onnx
         initialize_onnx()
 
-    initialize_zluda()
+    if sys.platform == "win32" and (devices.backend == "zluda" or devices.backend == "rocm"):
+        from modules.rocm_triton_windows import apply_triton_patches
+        apply_triton_patches()
+
+        if devices.backend == "zluda":
+            from modules.zluda import initialize_zluda
+            initialize_zluda()
